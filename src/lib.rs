@@ -1,25 +1,14 @@
 #![warn(non_camel_case_types, non_upper_case_globals, unused_qualifications)]
 #![allow(clippy::unreadable_literal, clippy::bool_comparison)]
 
-use std::{cmp, u64};
-use std::convert::TryFrom;
+use std::{cmp, u64, usize};
 use std::hash::Hasher;
-use std::io::{Cursor, Read, Write};
-
-use bit_vec::BitVec;
+use std::io::Cursor;
 
 use base64::{Engine as _, engine::general_purpose};
+use bitvec::prelude as bv;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use fasthash::{FastHasher, HasherExt, murmur3::Hasher128_x64, murmur3::Hasher128_x86};
-
-pub mod reexports {
-    #[cfg(feature = "random")]
-    pub use ::getrandom;
-    pub use bit_vec;
-    pub use siphasher;
-    #[cfg(feature = "serde")]
-    pub use siphasher::reexports::serde;
-}
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub enum HashStrategy {
@@ -53,18 +42,16 @@ impl HashStrategy {
             }
         };
 
-        // println!("hashes {}, {}", hashes[0], hashes[1]);
-
         return hashes;
     }
 
-    fn bloom_hash(&self, hashes: &mut [i64; 2], k_i: u8) -> u64
+    fn bloom_hash(&self, hashes: &mut [i64; 2], k_i: u8) -> usize
     {
         if k_i > 0 {
             hashes[0] = hashes[0].wrapping_add(hashes[1]);
         }
 
-        return (hashes[0] & i64::MAX) as u64;
+        return (hashes[0] & i64::MAX) as usize;
     }
 
 
@@ -92,8 +79,8 @@ impl HashStrategy {
 /// Bloom filter structure
 #[derive(Clone, Debug)]
 pub struct Bloom {
-    bit_vec: BitVec<u64>,
-    bitmap_bits: u64,
+    bit_vec: bv::BitVec<u64>,
+    bitmap_bits: usize,
     hash_num: u8,
     hash_strategy: HashStrategy,
 }
@@ -106,15 +93,11 @@ impl Bloom {
     /// functions.
     pub fn new_with_hash_strategy(bitmap_size: usize, items_count: usize, hash_strategy: HashStrategy) -> Self {
         assert!(bitmap_size > 0 && items_count > 0);
-        let bitmap_bits = u64::try_from(bitmap_size)
-            .unwrap()
-            .checked_mul(8u64)
-            .unwrap();
-        let hash_num = Self::optimal_k_num(bitmap_bits, items_count);
+        let bitmap_bits = (bitmap_size as f64 / 64.0).ceil() as usize * 64;
+        let hash_num = Self::optimal_k_num(bitmap_size, items_count);
 
         // shailendra: align bit vec size to 8 bytes chunks
-        let bit_vec_size = (bitmap_bits as f64 / 64.0).ceil() as usize * 64;
-        let bit_vec = BitVec::from_elem(bit_vec_size, false);
+        let bit_vec = bv::BitVec::<u64, bv::Lsb0>::repeat(false, bitmap_bits as usize);
 
         Self {
             bit_vec,
@@ -154,8 +137,8 @@ impl Bloom {
     /// `ByteVec` structure. The state is assumed to be retrieved from an
     /// existing bloom filter.
     pub fn from_bit_vec(
-        bit_vec: BitVec<u64>,
-        bitmap_bits: u64,
+        bit_vec: bv::BitVec<u64>,
+        bitmap_bits: usize,
         hash_num: u8,
         hash_strategy: HashStrategy,
     ) -> Self {
@@ -164,20 +147,20 @@ impl Bloom {
             bitmap_bits,
             hash_num,
             hash_strategy,
-            // _phantom: PhantomData,
         }
     }
 
-    /// Create a bloom filter structure with an existing state given as a byte
-    /// array. The state is assumed to be retrieved from an existing bloom
-    /// filter.
+    // /// Create a bloom filter structure with an existing state given as a byte
+    // /// array. The state is assumed to be retrieved from an existing bloom
+    // /// filter.
     pub fn from_existing(
-        bytes: &[u8],
-        bitmap_bits: u64,
+        bytes: &[u64],
+        bitmap_bits: usize,
         hash_num: u8,
         hash_strategy: HashStrategy,
     ) -> Self {
-        Self::from_bit_vec(BitVec::from_bytes(bytes), bitmap_bits, hash_num, hash_strategy)
+        let bit_vec = bv::BitVec::<u64, bv::Lsb0>::from_slice(bytes);
+        Self::from_bit_vec(bit_vec, bitmap_bits, hash_num, hash_strategy)
     }
 
     pub fn compute_num_bits(items_count: usize, mut fp_p: f64) -> usize {
@@ -198,20 +181,15 @@ impl Bloom {
     /// and a fp_p rate of false positives.
     /// fp_p obviously has to be within the ]0.0, 1.0[ range.
     pub fn compute_bitmap_size(items_count: usize, fp_p: f64) -> usize {
-        let bit_count = Self::compute_num_bits(items_count, fp_p);
-        (bit_count as f64 / 8.0).ceil() as usize
+        return Self::compute_num_bits(items_count, fp_p);
     }
 
     /// Record the presence of an item.
     pub fn set(&mut self, item: &[u8])
     {
-        // println!("bit map bits: {}", self.bitmap_bits);
-
         let mut hashes = self.hash_strategy.init_bloom_hash(item);
         for k_i in 0..self.hash_num {
-            let bit_offset = (self.hash_strategy.bloom_hash(&mut hashes, k_i) % self.bitmap_bits) as usize;
-            // println!("for k_i={} bit_offset={}", k_i, bit_offset);
-
+            let bit_offset = self.hash_strategy.bloom_hash(&mut hashes, k_i) % self.bitmap_bits;
             self.bit_vec.set(bit_offset, true);
         }
     }
@@ -221,11 +199,14 @@ impl Bloom {
     pub fn check(&self, item: &[u8]) -> bool
     {
         let mut hashes = self.hash_strategy.init_bloom_hash(item);
-        for k_i in 0..self.hash_num {
-            let bit_offset = (self.hash_strategy.bloom_hash(&mut hashes, k_i) % self.bitmap_bits) as usize;
-            // println!("for k_i={} bit_offset={}", k_i, bit_offset);
 
-            if self.bit_vec.get(bit_offset).unwrap() == false {
+        for k_i in 0..self.hash_num {
+            let hash = self.hash_strategy.bloom_hash(&mut hashes, k_i);
+            let bit_offset = hash % self.bitmap_bits;
+
+            let val = self.bit_vec[bit_offset];
+
+            if !val {
                 return false;
             }
         }
@@ -249,17 +230,17 @@ impl Bloom {
     }
 
     /// Return the bitmap as a vector of bytes
-    pub fn bitmap(&self) -> Vec<u8> {
-        self.bit_vec.to_bytes()
+    pub fn bitmap(&self) -> &[u64] {
+        self.bit_vec.as_raw_slice()
     }
 
     /// Return the bitmap as a "BitVec" structure
-    pub fn bit_vec(&self) -> &BitVec<u64> {
+    pub fn bit_vec(&self) -> &bv::BitVec<u64> {
         &self.bit_vec
     }
 
     /// Return the number of bits in the filter
-    pub fn number_of_bits(&self) -> u64 {
+    pub fn number_of_bits(&self) -> usize {
         self.bitmap_bits
     }
 
@@ -273,7 +254,7 @@ impl Bloom {
     }
 
     #[allow(dead_code)]
-    pub fn optimal_k_num(bitmap_bits: u64, items_count: usize) -> u8 {
+    pub fn optimal_k_num(bitmap_bits: usize, items_count: usize) -> u8 {
         let m = bitmap_bits as f64;
         let n = items_count as f64;
         let k_num = (m / n * f64::ln(2.0f64)).ceil() as u8;
@@ -282,12 +263,12 @@ impl Bloom {
 
     /// Clear all of the bits in the filter, removing all keys from the set
     pub fn clear(&mut self) {
-        self.bit_vec.clear()
+        self.bit_vec.fill(false)
     }
 
     /// Set all of the bits in the filter, making it appear like every key is in the set
     pub fn fill(&mut self) {
-        self.bit_vec.set_all()
+        self.bit_vec.fill(true)
     }
 
     /// Test if there are no elements in the set
@@ -305,42 +286,14 @@ impl Bloom {
         self.hash_strategy.dumps(&mut result);
         result.write_u8(self.hash_num).unwrap();
 
-        println!("bit vec len: {}", self.bit_vec.len());
-        println!("bit vec bits: {}", self.bitmap_bits);
-        println!("actual length of bit vec: {}", self.bit_vec.to_bytes().len());
-
         let num_u64 = (self.bit_vec.len() as f64 / 64.0).ceil() as u32;
-        println!("num_u64 in dumps: {}", num_u64);
         result.write_u32::<BigEndian>(num_u64).unwrap();
 
-        // let data = &self.bit_vec.to_bytes();
-        // for chunk in data.chunks(8) {
-        //     println!("chunk in dumps: {:?}", chunk);
-        //     let rev_chunk: Vec<_> = chunk.iter().rev().cloned().collect();
-        //
-        //     println!("reverse chunk in dumps: {:?}", rev_chunk);
-        //     result.write(&rev_chunk).unwrap();
-        // }
+        let bit_slices = self.bit_vec.as_raw_slice();
 
-        for i in 0_usize..num_u64 as usize {
-            let chunk = &self.bit_vec[i..i + 64];
-            println!("chunk in dumps: {:?}", chunk);
-            let rev_chunk = chunk.reverse();
-
-            println!("reverse chunk in dumps: {:?}", rev_chunk);
-            result.write(&rev_chunk).unwrap();
+        for slice in bit_slices {
+            result.write_u64::<BigEndian>(*slice).unwrap();
         }
-
-        // result.write(&self.bit_vec.to_bytes()).unwrap();
-
-        // self.bit_vec.to_bytes()
-        //     .chunks_exact(8)
-        //     .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()));
-        //
-        // for chunk in self.bit_vec.to_bytes().chunks_exact(8) {
-        //     result.write_u64::<BigEndian>()
-        //     let reversed: Vec<u8> = chunk.iter().rev().copied().collect();
-        // }
 
         result
     }
@@ -357,27 +310,16 @@ impl Bloom {
         let mut cursor = Cursor::new(array);
         let strategy = HashStrategy::from_bytes(&mut cursor)?;
         let hash_num = cursor.read_u8().unwrap();
-        let num_u64 = cursor.read_u32::<BigEndian>().unwrap() as u64;
+        let num_u64 = cursor.read_u32::<BigEndian>().unwrap() as usize;
 
-        println!("Num Longs in read: {}", num_u64);
-
-        let mut data = Vec::new(); // vec![0u8; num_u64 as usize * 8];
+        let mut data = Vec::with_capacity(num_u64);
         for _ in 0..num_u64 {
-            let mut chunk = vec![0u8; 8];
-            cursor.read_exact(&mut chunk).unwrap();
-            chunk.reverse();
-            println!("chunk: {:?}", chunk);
-
-            data.write(&chunk).unwrap();
-            // let val = cursor.read_u64::<BigEndian>().unwrap();
+            let val = cursor.read_u64::<BigEndian>().unwrap();
+            data.push(val);
         }
 
-        println!("data: {:?}", data);
-
-        // cursor.read_exact(&mut data).unwrap();
-
         // Create and setup the instance
-        let instance = Bloom::from_existing(&data, num_u64, hash_num, strategy);
+        let instance = Bloom::from_existing(&data, num_u64 * 64, hash_num, strategy);
 
         Ok(instance)
     }

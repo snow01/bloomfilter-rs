@@ -3,8 +3,10 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use base64::{Engine as _, engine::general_purpose};
-use bloomfilter::{Bloom, reexports::getrandom::getrandom};
+use getrandom::getrandom;
 use rand::Rng;
+
+use bloomfilter::Bloom;
 
 #[allow(dead_code)]
 fn guava_file_dir() -> PathBuf {
@@ -81,9 +83,7 @@ fn bloom_test_load() {
 #[test]
 #[cfg(feature = "random")]
 fn test_num_of_bits() {
-    // tuple = (num items, fp, exact num bits, bit vec size, num hashes)
-    // let python_test_cases = [(500, 0.01, 4792, 7), (500, 0.0, 774727, 1074), (10, 0.01, 95, 7)];
-    let test_cases = [(500, 0.01, 4793, 4800, 7), (500, 0.000001, 14378, 14384, 20), (10, 0.01, 96, 96, 7)];
+    let test_cases = [(500, 0.01, 4793, 4800, 7), (500, 0.000001, 14378, 14400, 20), (10, 0.01, 96, 128, 7)];
     for (i, case) in test_cases.iter().enumerate() {
         let actual_bits = Bloom::compute_num_bits(case.0, case.1);
         assert_eq!(actual_bits, case.2, "For case {} got num bits={} but expected={}", i, actual_bits, case.2);
@@ -94,8 +94,6 @@ fn test_num_of_bits() {
 
         let num_hash_functions = bloom_filter.number_of_hash_functions();
         assert_eq!(num_hash_functions, case.4, "For case {} got num hash functions={} but expected={}", i, num_hash_functions, case.3);
-
-        println!("Case {} is successful", i)
     }
 }
 
@@ -195,18 +193,15 @@ fn test_dumps() {
 #[test]
 #[cfg(feature = "random")]
 fn test_guava_compatibility_1() {
+    let data = read_data("500_0_01_0_to_99_test.out").unwrap();
+    let loaded_bloom_filter = Bloom::from_bytes(&data).unwrap();
+
     let mut new_bloom_filter = Bloom::new_for_fp_rate(500, 0.01);
     for i in 0_i32..100 {
-        // println!("====> for value: {}", i);
-        let item = i.to_be_bytes();
+        let item = i.to_le_bytes();
 
         new_bloom_filter.set(&item);
     }
-
-    new_bloom_filter.dumps();
-
-    let data = read_data("500_0_01_0_to_99_test.out").unwrap();
-    let loaded_bloom_filter = Bloom::from_bytes(&data).unwrap();
 
     assert_eq!(
         new_bloom_filter.number_of_hash_functions(),
@@ -224,22 +219,22 @@ fn test_guava_compatibility_1() {
         loaded_bloom_filter.hash_strategy(),
     );
 
-    // assert_eq!(
-    //     new_bloom_filter.bitmap(),
-    //     loaded_bloom_filter.bitmap(),
-    //     "New filter's data is expected to be the same as loaded filter's",
-    // );
+    assert_eq!(
+        new_bloom_filter.bitmap(),
+        loaded_bloom_filter.bitmap(),
+        "New filter's data is expected to be the same as loaded filter's",
+    );
 
-    // assert_eq!(
-    //     new_bloom_filter.dumps_to_hex(),
-    //     loaded_bloom_filter.dumps_to_hex(),
-    //     "New filter's dump = {} is expected to be the same as loaded filter's = {}",
-    //     new_bloom_filter.dumps_to_hex(),
-    //     loaded_bloom_filter.dumps_to_hex(),
-    // );
+    assert_eq!(
+        new_bloom_filter.dumps_to_hex(),
+        loaded_bloom_filter.dumps_to_hex(),
+        "New filter's dump = {} is expected to be the same as loaded filter's = {}",
+        new_bloom_filter.dumps_to_hex(),
+        loaded_bloom_filter.dumps_to_hex(),
+    );
 
     for i in 0_i32..100 {
-        let item = i.to_be_bytes();
+        let item = i.to_le_bytes();
 
         assert!(loaded_bloom_filter.check(&item), "Number {} is expected to be in bloomfilter", i);
     }
@@ -253,7 +248,7 @@ fn test_guava_compatibility_2() {
 
     let mut new_bloom_filter = Bloom::new_for_fp_rate(100, 0.001);
     for i in 0_i32..50 {
-        let item = i.to_be_bytes();
+        let item = i.to_le_bytes();
 
         new_bloom_filter.set(&item);
     }
@@ -271,7 +266,15 @@ fn test_guava_compatibility_2() {
         loaded_bloom_filter.hash_strategy(),
         "New filter's strategy = {:?} is expected to be the same as loaded filter's = {:?}",
         new_bloom_filter.hash_strategy(),
-        new_bloom_filter.hash_strategy(),
+        loaded_bloom_filter.hash_strategy(),
+    );
+
+    assert_eq!(
+        new_bloom_filter.number_of_bits(),
+        loaded_bloom_filter.number_of_bits(),
+        "New filter's number of bits = {:?} is expected to be the same as loaded filter's = {:?}",
+        new_bloom_filter.number_of_bits(),
+        loaded_bloom_filter.number_of_bits(),
     );
 
     assert_eq!(
@@ -289,7 +292,7 @@ fn test_guava_compatibility_2() {
     );
 
     for i in 0_i32..50 {
-        let item = i.to_be_bytes();
+        let item = i.to_le_bytes();
 
         assert!(loaded_bloom_filter.check(&item), "Number {} is expected to be in bloomfilter", i);
     }
